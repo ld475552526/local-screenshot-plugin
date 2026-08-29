@@ -1,0 +1,4 @@
+.build/
+.swiftpm/
+QuickClip.app/
+.DS_Store
