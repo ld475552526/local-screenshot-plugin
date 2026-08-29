@@ -1,23 +1,23 @@
 import AppKit
-import Carbon.HIToolbox
 import os
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let shortcutManager = ShortcutManager.shared
     private var statusItem: NSStatusItem!
-    private var selector: ScreenshotSelector?
     private var feedbackResetWorkItem: DispatchWorkItem?
     private let logger = Logger(subsystem: "com.local.quickclip", category: "app")
+    private lazy var captureCoordinator = CaptureCoordinator { [weak self] event in
+        self?.handleCaptureEvent(event)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenuBarItem()
         enableLaunchAtLoginByDefault()
         shortcutManager.onShortcutPressed = { [weak self] in
-            self?.handleShortcutPressed()
+            self?.beginCapture()
         }
         shortcutManager.registerCurrentShortcut()
-        logger.info("Screen capture preflight on launch: \(CGPreflightScreenCaptureAccess(), privacy: .public)")
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -28,18 +28,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildMenuBarItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let iconPath = Bundle.main.path(forResource: "QuickClipIcon", ofType: "png"), let icon = NSImage(contentsOfFile: iconPath) {
-            icon.size = NSSize(width: 18, height: 18)
-            statusItem.button?.image = icon
-        } else {
-            statusItem.button?.image = NSImage(systemSymbolName: "rectangle.dashed", accessibilityDescription: "QuickClip")
-        }
+        statusItem.button?.image = appIcon()
         statusItem.button?.toolTip = "QuickClip"
 
         let menu = NSMenu()
         let shortcutInfo = menu.addItem(withTitle: "当前快捷键：\(shortcutManager.currentShortcutDescription)", action: nil, keyEquivalent: "")
         shortcutInfo.isEnabled = false
-        menu.addItem(withTitle: "框选截图并复制", action: #selector(beginSelection), keyEquivalent: "")
+        menu.addItem(withTitle: "框选截图并复制", action: #selector(beginCapture), keyEquivalent: "")
         menu.addItem(withTitle: "开机自动启动", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         menu.items.last?.state = LoginItemManager.isEnabled ? .on : .off
         menu.addItem(withTitle: "快捷键设置…", action: #selector(openSettings), keyEquivalent: "")
@@ -49,45 +44,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    private func handleShortcutPressed() {
-        NSLog("QuickClip global shortcut received: %@", shortcutManager.currentShortcutDescription)
-        beginSelection()
+    private func appIcon() -> NSImage? {
+        if let path = Bundle.main.path(forResource: "QuickClipIcon", ofType: "png"), let icon = NSImage(contentsOfFile: path) {
+            icon.size = NSSize(width: 18, height: 18)
+            return icon
+        }
+        return NSImage(systemSymbolName: "rectangle.dashed", accessibilityDescription: "QuickClip")
     }
 
-    @objc private func beginSelection() {
-        let hasScreenCaptureAccess = CGPreflightScreenCaptureAccess()
-        logger.info("Screen capture preflight on shortcut: \(hasScreenCaptureAccess, privacy: .public)")
-        guard hasScreenCaptureAccess else {
-            let requestedAccess = CGRequestScreenCaptureAccess()
-            logger.info("Screen capture access request result: \(requestedAccess, privacy: .public)")
-            if requestedAccess {
-                beginSelection()
-                return
-            }
-            let alert = NSAlert()
-            alert.messageText = "需要“屏幕录制”权限"
-            alert.informativeText = "QuickClip 需要读取屏幕内容才能截图。请在系统设置中允许后再试。"
-            alert.addButton(withTitle: "前往系统设置")
-            alert.addButton(withTitle: "取消")
-            if alert.runModal() == .alertFirstButtonReturn { openScreenRecordingSettings() }
-            return
-        }
-
-        guard selector == nil else { return }
-        selector = ScreenshotSelector { [weak self] result in
-            self?.selector = nil
-            switch result {
-            case .success:
-                self?.showCopiedFeedback()
-            case .failure(let error):
-                if case ScreenshotSelector.SelectionError.cancelled = error { return }
-                self?.showCaptureFailure()
-            }
-        }
-        selector?.show()
+    @objc private func beginCapture() {
+        logger.info("Capture requested")
+        captureCoordinator.start()
     }
 
-    @objc private func openSettings() { SettingsWindowController.showWindow() }
+    private func handleCaptureEvent(_ event: CaptureCoordinator.Event) {
+        switch event {
+        case .copied:
+            showCopiedFeedback()
+        case .permissionDenied:
+            showScreenRecordingPermissionAlert()
+        case .failed:
+            showCaptureFailure()
+        }
+    }
+
+    @objc private func openSettings() {
+        SettingsWindowController.showWindow()
+    }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
         do {
@@ -106,7 +89,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func quit() { NSApp.terminate(nil) }
+    @objc private func quit() {
+        NSApp.terminate(nil)
+    }
 
     private func showCopiedFeedback() {
         feedbackResetWorkItem?.cancel()
@@ -120,6 +105,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: reset)
     }
 
+    private func showScreenRecordingPermissionAlert() {
+        let alert = NSAlert()
+        alert.messageText = "需要“屏幕录制”权限"
+        alert.informativeText = "QuickClip 需要读取屏幕内容才能截图。请在系统设置中允许后再试。"
+        alert.addButton(withTitle: "前往系统设置")
+        alert.addButton(withTitle: "取消")
+        if alert.runModal() == .alertFirstButtonReturn {
+            openScreenRecordingSettings()
+        }
+    }
+
     private func openScreenRecordingSettings() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
         NSWorkspace.shared.open(url)
@@ -128,7 +124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showCaptureFailure() {
         let alert = NSAlert()
         alert.messageText = "截图失败"
-        alert.informativeText = "无法获取所选区域。请确认已允许“屏幕录制”权限后重试。"
+        alert.informativeText = "系统截图工具未能完成截图，请稍后重试。"
         alert.runModal()
     }
 
@@ -137,7 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             try LoginItemManager.install()
         } catch {
-            NSLog("QuickClip could not install its launch agent: %@", error.localizedDescription)
+            logger.error("Could not install launch agent: \(error.localizedDescription, privacy: .public)")
         }
     }
 }
