@@ -3,10 +3,17 @@ import QuickClipCore
 
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private static var shared: SettingsWindowController?
+
     private let recorder = ShortcutRecorderButton()
+    private let saveButton = NSButton(title: "保存快捷键", target: nil, action: nil)
+    private let recordAgainButton = NSButton(title: "重新录制", target: nil, action: nil)
+    private var editorState: ShortcutEditorState
+    private var pendingShortcut: (character: String, modifiers: NSEvent.ModifierFlags)?
+    private var didCommit = false
 
     static func showWindow() {
         if shared == nil { shared = SettingsWindowController() }
+        shared?.prepareForPresentation()
         shared?.showWindow(nil)
         shared?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -14,8 +21,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     init() {
+        editorState = ShortcutEditorState(currentShortcut: ShortcutManager.shared.currentShortcutDescription)
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 430, height: 210),
+            contentRect: NSRect(x: 0, y: 0, width: 440, height: 230),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -34,30 +42,37 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         let title = NSTextField(labelWithString: "设置截图快捷键")
         title.font = .boldSystemFont(ofSize: 16)
-        let hint = NSTextField(wrappingLabelWithString: "窗口打开后，直接按下想使用的组合键即可保存。至少包含 Option、Control 或 Shift 之一；按 Esc 保留原快捷键。")
+        let hint = NSTextField(wrappingLabelWithString: "直接按下组合键后，会先显示在下方。确认无误后点击“保存快捷键”才会生效。按 Esc 取消本次录制。")
         hint.textColor = .secondaryLabelColor
 
         recorder.font = .systemFont(ofSize: 18, weight: .medium)
         recorder.bezelStyle = .rounded
-        recorder.translatesAutoresizingMaskIntoConstraints = false
-        recorder.onRecorded = { character, modifiers in
-            let didUpdate = ShortcutManager.shared.update(character: character, modifiers: modifiers)
-            if !didUpdate { ShortcutManager.shared.suspendCurrentShortcut() }
-            return didUpdate
+        recorder.target = self
+        recorder.action = #selector(beginRecording)
+        recorder.onRecorded = { [weak self] character, modifiers, description in
+            self?.record(shortcut: character, modifiers: modifiers, description: description)
         }
         recorder.onCancelled = { [weak self] in
-            self?.restoreCurrentShortcut()
+            self?.cancelRecording()
         }
 
-        let keyRow = NSStackView(views: [NSTextField(labelWithString: "按下组合键"), recorder])
+        let keyRow = NSStackView(views: [NSTextField(labelWithString: "候选快捷键"), recorder])
         keyRow.orientation = .horizontal
         keyRow.alignment = .centerY
         keyRow.spacing = 14
         recorder.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
 
+        recordAgainButton.target = self
+        recordAgainButton.action = #selector(beginRecording)
+        saveButton.target = self
+        saveButton.action = #selector(saveShortcut)
+        saveButton.keyEquivalent = "\r"
+        saveButton.isEnabled = false
         let cancel = NSButton(title: "取消", target: self, action: #selector(closeWindow))
-        let buttons = NSStackView(views: [cancel])
-        buttons.alignment = .trailing
+        let buttons = NSStackView(views: [cancel, recordAgainButton, saveButton])
+        buttons.orientation = .horizontal
+        buttons.alignment = .centerY
+        buttons.spacing = 10
 
         let stack = NSStackView(views: [title, hint, keyRow, buttons])
         stack.orientation = .vertical
@@ -73,27 +88,68 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         ])
     }
 
-    private func beginRecording() {
-        recorder.displayedShortcut = ShortcutManager.shared.currentShortcutDescription
-        ShortcutManager.shared.suspendCurrentShortcut()
-        recorder.startRecording()
+    private func prepareForPresentation() {
+        didCommit = false
+        pendingShortcut = nil
+        editorState.reset(currentShortcut: ShortcutManager.shared.currentShortcutDescription)
+        recorder.displayedShortcut = editorState.previewShortcut
+        recorder.stopRecording()
+        refreshControls()
     }
 
-    private func restoreCurrentShortcut() {
+    @objc private func beginRecording() {
+        editorState.beginRecording()
+        ShortcutManager.shared.suspendCurrentShortcut()
+        recorder.startRecording()
+        refreshControls()
+    }
+
+    private func record(shortcut: String, modifiers: NSEvent.ModifierFlags, description: String) {
+        pendingShortcut = (shortcut, modifiers)
+        editorState.record(shortcut: description)
+        recorder.displayedShortcut = editorState.previewShortcut
+        refreshControls()
+    }
+
+    private func cancelRecording() {
+        editorState.cancelRecording()
+        recorder.displayedShortcut = editorState.previewShortcut
         ShortcutManager.shared.resumeCurrentShortcut()
+        refreshControls()
+    }
+
+    @objc private func saveShortcut() {
+        guard let pendingShortcut else { return }
+
+        guard ShortcutManager.shared.update(character: pendingShortcut.character, modifiers: pendingShortcut.modifiers) else {
+            ShortcutManager.shared.suspendCurrentShortcut()
+            return
+        }
+
+        editorState.saveSucceeded()
+        didCommit = true
+        closeWindow()
+    }
+
+    private func refreshControls() {
+        saveButton.isEnabled = editorState.canSave
+        recordAgainButton.isEnabled = !editorState.isRecording
     }
 
     func windowWillClose(_ notification: Notification) {
-        guard recorder.isRecording else { return }
         recorder.stopRecording()
-        restoreCurrentShortcut()
+        if !didCommit {
+            ShortcutManager.shared.resumeCurrentShortcut()
+        }
     }
 
-    @objc private func closeWindow() { window?.close() }
+    @objc private func closeWindow() {
+        window?.close()
+    }
 }
 
 private final class ShortcutRecorderButton: NSButton {
-    var onRecorded: ((String, NSEvent.ModifierFlags) -> Bool)?
+    var onRecorded: ((String, NSEvent.ModifierFlags, String) -> Void)?
     var onCancelled: (() -> Void)?
     var displayedShortcut = "" {
         didSet {
@@ -144,14 +200,9 @@ private final class ShortcutRecorderButton: NSButton {
         }
 
         let description = Self.description(for: character, modifiers: modifiers)
-        guard onRecorded?(character, modifiers) == true else {
-            title = "无法使用 \(description)，请再试一次"
-            return
-        }
-
         displayedShortcut = description
         stopRecording()
-        window?.performClose(nil)
+        onRecorded?(character, modifiers, description)
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
